@@ -1,0 +1,73 @@
+name: Backup PDS
+
+on:
+  schedule:
+    - cron: "17 3 * * 0" # Sundays 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PDS_URL: https://pds.inovuslabs.org
+      DID: did:plc:2fftr5c2q5za7tbw5fmoowjt
+      RECOVERY_KEY: did:key:zQ3shUoYPuSTdh5BuaR3SNK1DHjkuBkCgyHx9edosmUH4rRMt
+      R2_BUCKET: pds-inovuslabs-blobs
+      R2_ENDPOINT: https://6fa7a1660dd091afd88cdc6d7059e6f0.r2.cloudflarestorage.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Snapshot repo and blobs
+        id: snapshot
+        run: node scripts/backup.mjs out
+
+      - name: Upload to R2 (backups/)
+        id: upload
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          SNAPSHOT: ${{ steps.snapshot.outputs.snapshot }}
+        run: |
+          aws s3 cp "out/$SNAPSHOT" "s3://$R2_BUCKET/backups/$SNAPSHOT" \
+            --recursive --endpoint-url "$R2_ENDPOINT" --only-show-errors
+          local_count=$(find "out/$SNAPSHOT" -type f | wc -l)
+          remote_count=$(aws s3 ls "s3://$R2_BUCKET/backups/$SNAPSHOT/" \
+            --recursive --endpoint-url "$R2_ENDPOINT" | wc -l)
+          echo "uploaded $remote_count/$local_count files to backups/$SNAPSHOT"
+          test "$remote_count" -eq "$local_count"
+
+      - name: Summary
+        if: steps.snapshot.outcome == 'success'
+        env:
+          SNAPSHOT: ${{ steps.snapshot.outputs.snapshot }}
+        run: |
+          {
+            echo "### Backup $SNAPSHOT"
+            echo '```json'
+            jq '{commit, rev, records, recordCounts, blobCount, car: .car.size}' "out/$SNAPSHOT/manifest.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Send Discord notification
+        if: always()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SNAPSHOT: ${{ steps.snapshot.outputs.snapshot }}
+          SNAPSHOT_RESULT: ${{ steps.snapshot.outcome }}
+          UPLOAD_RESULT: ${{ steps.upload.outcome }}
+          MANIFEST: out/${{ steps.snapshot.outputs.snapshot }}/manifest.json
+        run: node scripts/notify.mjs
